@@ -72,7 +72,7 @@ def get_llm_analysis(prompt, temperature=0.7, max_tokens=2000):
             messages=[
                 {"role": "system", "content": "You are an expert sales analyst. Provide concise, actionable insights."},
                 {"role": "user", "content": prompt}
-            ],and 
+            ],
             temperature=temperature,
             max_tokens=max_tokens
         )
