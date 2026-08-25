@@ -1,48 +1,108 @@
 from flask import Flask, jsonify, request
+from flask_cors import CORS
 import pandas as pd
 import openai
 from datetime import datetime
 import os
+import logging
+import time
+from functools import wraps
 from dotenv import load_dotenv
 
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
+CORS(app)
 
 openai.api_key = os.getenv('OPENAI_API_KEY', 'YPUR_API_KEY HERE')
+
+_sales_data_cache = None
+_cache_timestamp = 0
+CACHE_TTL = 300
+
+def get_cached_sales_data():
+    global _sales_data_cache, _cache_timestamp
+    current_time = time.time()
+    if _sales_data_cache is not None and (current_time - _cache_timestamp) < CACHE_TTL:
+        logger.info("Returning cached sales data")
+        return _sales_data_cache
+    _sales_data_cache = load_sales_data()
+    _cache_timestamp = current_time
+    return _sales_data_cache
+
+def rate_limit(max_calls=10, period=60):
+    calls = []
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            now = time.time()
+            calls[:] = [c for c in calls if now - c < period]
+            if len(calls) >= max_calls:
+                return jsonify({"error": "Rate limit exceeded. Try again later."}), 429
+            calls.append(now)
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
 
 def load_sales_data():
     try:
         csv_files = [f for f in os.listdir('.') if f.endswith('.csv') and 'sales' in f.lower()]
         
         if not csv_files:
-            print("No sales CSV file found!")
+            logger.warning("No sales CSV file found!")
             return pd.DataFrame()
         csv_path = csv_files[0]
         df = pd.read_csv(csv_path)
         df.columns = df.columns.str.strip().str.lower()
         if 'date' not in df.columns:
             df['date'] = pd.date_range(start=datetime.now(), periods=len(df), freq='D')
+        logger.info(f"Loaded {len(df)} rows from {csv_path}")
         return df
     except Exception as e:
-        print(f"Error loading CSV: {str(e)}")
+        logger.error(f"Error loading CSV: {str(e)}")
         return pd.DataFrame()
 
-def get_llm_analysis(prompt):
+def get_llm_analysis(prompt, temperature=0.7, max_tokens=2000):
     try:
         response = openai.chat.completions.create(
-            model="gpt-4",
-            messages=[{"role": "user", "content": prompt}]
+            model=os.getenv('LLM_MODEL', 'gpt-4'),
+            messages=[
+                {"role": "system", "content": "You are an expert sales analyst. Provide concise, actionable insights."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens
         )
+        logger.info(f"LLM analysis completed, tokens used: {response.usage.total_tokens}")
         return response.choices[0].message.content
+    except openai.RateLimitError:
+        logger.warning("OpenAI rate limit hit")
+        return "Analysis temporarily unavailable due to rate limiting. Please retry in a moment."
+    except openai.AuthenticationError:
+        logger.error("Invalid OpenAI API key")
+        return "Analysis unavailable: authentication error."
     except Exception as e:
-        print(f"LLM Analysis Error: {str(e)}")
+        logger.error(f"LLM Analysis Error: {str(e)}")
         return "Unable to generate AI analysis at this time."
 
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    df = get_cached_sales_data()
+    return jsonify({
+        "status": "healthy",
+        "data_loaded": not df.empty,
+        "row_count": len(df),
+        "timestamp": datetime.now().isoformat(),
+        "version": "1.1.0"
+    })
+
 @app.route('/api/team_performance', methods=['GET'])
+@rate_limit(max_calls=20, period=60)
 def team_performance():
-    # Overall team performance
-    df = load_sales_data()
+    df = get_cached_sales_data()
     if df.empty:
         return jsonify({"error": "Failed to load sales data"}), 500
 
@@ -130,11 +190,11 @@ def team_performance():
         return jsonify({"error": f"Internal processing error: {str(e)}"}), 500
 
 @app.route('/api/performance_trends', methods=['GET'])
+@rate_limit(max_calls=20, period=60)
 def performance_trends():
-    # Performance trends
     time_period = request.args.get('time_period', 'monthly')
     
-    df = load_sales_data()
+    df = get_cached_sales_data()
     if df.empty:
         return jsonify({"error": "Failed to load sales data"}), 500
 
@@ -182,13 +242,69 @@ def performance_trends():
     except Exception as e:
         return jsonify({"error": f"Trend analysis error: {str(e)}"}), 500
 
+@app.route('/api/compare_reps', methods=['GET'])
+@rate_limit(max_calls=15, period=60)
+def compare_reps():
+    rep_ids = request.args.get('rep_ids', '')
+    if not rep_ids:
+        return jsonify({"error": "Provide comma-separated rep_ids parameter"}), 400
+
+    ids = [id.strip() for id in rep_ids.split(',')]
+    if len(ids) < 2:
+        return jsonify({"error": "At least 2 rep IDs required for comparison"}), 400
+
+    df = get_cached_sales_data()
+    if df.empty:
+        return jsonify({"error": "Failed to load sales data"}), 500
+
+    try:
+        comparisons = []
+        for rid in ids:
+            rep_data = df[df['employee_id'].astype(str) == str(rid)]
+            if rep_data.empty:
+                continue
+            comparisons.append({
+                "employee_id": rid,
+                "employee_name": rep_data['employee_name'].iloc[0],
+                "revenue_confirmed": float(rep_data['revenue_confirmed'].sum()),
+                "close_rate": float(rep_data['avg_close_rate_30_days'].mean()),
+                "tours_booked": int(rep_data['tours_booked'].sum()),
+                "applications": int(rep_data['applications'].sum()),
+                "avg_deal_value": float(rep_data['avg_deal_value_30_days'].mean()),
+            })
+
+        if len(comparisons) < 2:
+            return jsonify({"error": "Not enough valid reps found for comparison"}), 404
+
+        prompt = f"""
+        Compare the following sales representatives:
+        
+        {comparisons}
+        
+        Please provide:
+        1. Side-by-side performance comparison
+        2. Each rep's relative strengths and weaknesses
+        3. Who is performing best overall and why
+        4. Specific coaching suggestions for each rep
+        """
+
+        analysis = get_llm_analysis(prompt)
+        return jsonify({
+            "comparisons": comparisons,
+            "analysis": analysis
+        })
+    except Exception as e:
+        logger.error(f"Comparison error: {str(e)}")
+        return jsonify({"error": f"Comparison error: {str(e)}"}), 500
+
 @app.route('/api/rep_performance', methods=['GET'])
+@rate_limit(max_calls=20, period=60)
 def rep_performance():
     rep_id = request.args.get('rep_id')
     if not rep_id:
         return jsonify({"error": "Rep ID is required"}), 400
 
-    df = load_sales_data()
+    df = get_cached_sales_data()
     if df.empty:
         return jsonify({"error": "Failed to load sales data"}), 500
 
@@ -275,5 +391,51 @@ def rep_performance():
     except Exception as e:
         return jsonify({"error": f"Representative analysis error: {str(e)}"}), 500
 
+@app.route('/api/export', methods=['GET'])
+def export_data():
+    format_type = request.args.get('format', 'json')
+    df = get_cached_sales_data()
+    if df.empty:
+        return jsonify({"error": "No data available"}), 500
+
+    if format_type == 'json':
+        return jsonify(df.to_dict(orient='records'))
+    elif format_type == 'csv':
+        csv_data = df.to_csv(index=False)
+        return csv_data, 200, {'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename=sales_export.csv'}
+    elif format_type == 'summary':
+        summary = {
+            "total_rows": len(df),
+            "columns": list(df.columns),
+            "date_range": {
+                "start": str(df['date'].min()) if 'date' in df.columns else None,
+                "end": str(df['date'].max()) if 'date' in df.columns else None
+            },
+            "total_revenue": float(df['revenue_confirmed'].sum()),
+            "unique_employees": int(df['employee_id'].nunique())
+        }
+        return jsonify(summary)
+    else:
+        return jsonify({"error": "Unsupported format. Use 'json', 'csv', or 'summary'"}), 400
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"error": "Endpoint not found", "available_endpoints": [
+        "/api/health",
+        "/api/team_performance",
+        "/api/performance_trends?time_period=monthly|quarterly",
+        "/api/rep_performance?rep_id=<id>",
+        "/api/compare_reps?rep_ids=<id1>,<id2>",
+        "/api/export?format=json|csv|summary"
+    ]}), 404
+
+@app.errorhandler(500)
+def internal_error(e):
+    logger.error(f"Internal server error: {str(e)}")
+    return jsonify({"error": "Internal server error"}), 500
+
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    port = int(os.getenv('PORT', 5000))
+    debug = os.getenv('FLASK_DEBUG', 'true').lower() == 'true'
+    logger.info(f"Starting Sales Performance API on port {port}")
+    app.run(debug=debug, host='0.0.0.0', port=port)
