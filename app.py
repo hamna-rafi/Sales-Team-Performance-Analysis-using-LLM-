@@ -75,7 +75,7 @@ def get_llm_analysis(prompt, temperature=0.7, max_tokens=2000):
             ],
             temperature=temperature,
             max_tokens=max_tokens
-        ) 
+        ) and u
         logger.info(f"LLM analysis completed, tokens used: {response.usage.total_tokens}")
         return response.choices[0].message.content
     except openai.RateLimitError:
